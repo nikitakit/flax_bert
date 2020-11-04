@@ -1,0 +1,19 @@
+absl-py==0.10.0
+datasets==1.1.2
+# -e git+https://github.com/google/flax.git@cfaefc72178b72c87aa3028a3e613b48afcebc42#egg=flax
+ipykernel==5.3.4
+ipython==7.16.1
+ipywidgets==7.5.1
+jax==0.2.4
+jupyter-client==6.1.7
+jupyter-core==4.6.3
+ml-collections==0.1.0
+notebook==6.1.4
+scikit-learn==0.23.2
+tokenizers==0.9.2
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch==1.6.0+cpu
+torchvision==0.7.0+cpu
+tqdm==4.50.2
+transformers==3.4.0
+widgetsnbextension==3.5.1
