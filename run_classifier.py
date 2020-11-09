@@ -120,15 +120,21 @@ def create_model(config, num_classes=2):
 
 
 def create_optimizer(config, model):
+  if config.optimizer == 'adam':
+    optimizer_cls = optim.Adam
+  elif config.optimizer == 'lamb':
+    optimizer_cls = optim.LAMB
+  else:
+    raise ValueError('Unsupported value for optimizer: {config.optimizer}')
   common_kwargs = dict(
     learning_rate=config.learning_rate,
     beta1=0.9,
     beta2=0.999,
     eps=1e-6,
   )
-  optimizer_decay_def = optim.Adam(
+  optimizer_decay_def = optimizer_cls(
     weight_decay=0.01, **common_kwargs)
-  optimizer_no_decay_def = optim.Adam(
+  optimizer_no_decay_def = optimizer_cls(
     weight_decay=0.0, **common_kwargs)
   decay = optim.ModelParamTraversal(lambda path, _: 'bias' not in path)
   no_decay = optim.ModelParamTraversal(lambda path, _: 'bias' in path)

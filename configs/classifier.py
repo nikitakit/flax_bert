@@ -38,7 +38,9 @@ def get_config(config_string=''):
     'eval_batch_size': 8,
     # Total batch size for predict.
     'predict_batch_size': 8,
-    # The base learning rate for Adam.
+    # Optimizer: either 'adam' or 'lamb
+    'optimizer': 'adam',
+    # The base learning rate for Adam or LAMB.
     'learning_rate': 5e-5,
     # Total number of training epochs to perform.
     'num_train_epochs': 3.0,

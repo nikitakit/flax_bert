@@ -61,15 +61,17 @@ def get_config(config_string=''):
     # Whether to run eval.
     'do_eval': True,
     # Total batch size for training.
-    'train_batch_size': 256,
+    'train_batch_size': 512,
     # Total batch size for eval.
     'eval_batch_size': 64,
-    # The base learning rate for Adam.
-    'learning_rate': 1e-4,
+    # Optimizer: either 'adam' or 'lamb
+    'optimizer': 'lamb',
+    # The base learning rate for Adam or LAMB.
+    'learning_rate': 6.25e-4,
     # Number of training steps.
-    'num_train_steps': 1000000,
+    'num_train_steps': 500000,
     # Number of warmup steps.
-    'num_warmup_steps': 10000,
+    'num_warmup_steps': 3125,
     # The maximum total input sequence length after tokenization.
     # Sequences longer than this will be truncated, and sequences shorter
     # than this will be padded. 
