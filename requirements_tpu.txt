@@ -12,8 +12,8 @@ notebook==6.1.4
 scikit-learn==0.23.2
 tokenizers==0.9.2
 --find-links https://download.pytorch.org/whl/torch_stable.html
-torch==1.6.0+cpu
-torchvision==0.7.0+cpu
+torch==1.7.0+cpu
+torchvision==0.8.1+cpu
 tqdm==4.50.2
 transformers==3.4.0
 widgetsnbextension==3.5.1

@@ -209,6 +209,7 @@ def main(argv):
   optimizer = create_optimizer(config, model)
   optimizer = optimizer.replicate()
   del model  # don't keep a copy of the initial model
+  optimizer = training.harmonize_across_hosts(optimizer)
 
   learning_rate_fn = training.create_learning_rate_scheduler(
       factors='constant * linear_warmup * linear_decay',

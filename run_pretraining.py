@@ -184,6 +184,7 @@ def main(argv):
   start_step = int(optimizer.state[0].step)
 
   optimizer = optimizer.replicate()
+  optimizer = training.harmonize_across_hosts(optimizer)
 
   os.environ['TOKENIZERS_PARALLELISM'] = 'true'
   tokenizer = BertTokenizerFast.from_pretrained(config.tokenizer)

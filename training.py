@@ -228,3 +228,16 @@ def create_eval_fn(stat_fn, sample_feature_name='idx'):
     return res
 
   return eval_fn
+
+def harmonize_across_hosts(optimizer):
+  """Ensure that model and optimizer parameters are identical for all hosts."""
+  if jax.host_count() == 1:
+    return optimizer
+  else:
+    selector = jnp.zeros(jax.local_device_count())
+    if jax.host_id() == 0:
+      selector = jax.ops.index_update(selector, 0, 1.0)
+    optimizer = jax.pmap(
+      lambda opt, sel: jax.tree_map(lambda x: jax.lax.psum(x * sel.astype(x.dtype), 'i'), opt),
+      axis_name='i')(optimizer, selector)
+    return optimizer
