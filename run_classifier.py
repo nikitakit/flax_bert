@@ -16,6 +16,7 @@
 
 import datetime
 import functools
+import logging
 import os
 import typing
 
@@ -190,6 +191,8 @@ def main(argv):
   config = get_config()
 
   datasets.logging.set_verbosity_error()
+  # Workaround for https://github.com/huggingface/datasets/issues/812
+  logging.getLogger('filelock').setLevel(logging.ERROR)
   dataset = datasets.load_dataset(config.dataset_path, config.dataset_name)
   os.environ['TOKENIZERS_PARALLELISM'] = 'true'
   tokenizer = BertTokenizerFast.from_pretrained(config.tokenizer)

@@ -17,6 +17,7 @@
 import datetime
 import itertools
 import json
+import logging
 import os
 
 from absl import app
@@ -177,6 +178,9 @@ def main(argv):
     raise app.UsageError('Too many command-line arguments.')
 
   config = FLAGS.config
+
+  # Workaround for https://github.com/huggingface/datasets/issues/812
+  logging.getLogger('filelock').setLevel(logging.ERROR)
 
   model = create_model(config)
   optimizer = create_optimizer(config, model)
