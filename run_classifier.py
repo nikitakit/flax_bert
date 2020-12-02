@@ -37,6 +37,7 @@ import numpy as np
 from tensorflow.io import gfile
 
 import datasets
+import tensorflow_datasets as tfds
 import transformers
 from transformers import BertTokenizerFast
 
@@ -190,28 +191,26 @@ def main(argv):
 
   config = get_config()
 
-  datasets.logging.set_verbosity_error()
-  # Workaround for https://github.com/huggingface/datasets/issues/812
-  logging.getLogger('filelock').setLevel(logging.ERROR)
-  dataset = datasets.load_dataset(config.dataset_path, config.dataset_name)
   os.environ['TOKENIZERS_PARALLELISM'] = 'true'
   tokenizer = BertTokenizerFast.from_pretrained(config.tokenizer)
   tokenizer.model_max_length = config.max_seq_length
-  data_pipeline = data.ClassificationDataPipeline(dataset, tokenizer)
+  data_pipeline = data.ClassificationDataPipeline(
+    lambda: tfds.builder(f'{config.dataset_path}/{config.dataset_name}'),
+    tokenizer)
 
-  num_train_examples = len(dataset['train'])
+  num_train_examples = data_pipeline.dataset_builder.info.splits['train'].num_examples
   num_train_steps = int(
       num_train_examples * config.num_train_epochs // config.train_batch_size)
   warmup_steps = int(config.warmup_proportion * num_train_steps)
   cooldown_steps = num_train_steps - warmup_steps
 
   is_regression_task = (
-    dataset['train'].features['label'].dtype == 'float32')
+    data_pipeline.dataset_builder.info.features['label'].dtype == 'float32')
   if is_regression_task:
     num_classes = 1
     compute_stats = compute_regression_stats
   else:
-    num_classes = dataset['train'].features['label'].num_classes
+    num_classes = data_pipeline.dataset_builder.info.features['label'].num_classes
     compute_stats = compute_classification_stats
 
   model = create_model(config, num_classes=num_classes)
@@ -243,6 +242,12 @@ def main(argv):
       optimizer, train_state = train_step_fn(optimizer, batch, train_state)
 
   if config.do_eval:
+    # While our input pipelines use TFDS, we'll use metrics from the
+    # HuggingFace datasets library instead.
+    datasets.logging.set_verbosity_error()
+    # Workaround for https://github.com/huggingface/datasets/issues/812
+    logging.getLogger('filelock').setLevel(logging.ERROR)
+
     eval_step = training.create_eval_fn(compute_stats)
     eval_results = []
 

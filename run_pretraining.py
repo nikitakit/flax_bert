@@ -15,9 +15,9 @@
 """Run masked LM/next sentence masked_lm pre-training for BERT."""
 
 import datetime
+import glob
 import itertools
 import json
-import logging
 import os
 
 from absl import app
@@ -35,7 +35,6 @@ import jax.numpy as jnp
 import numpy as np
 from tensorflow.io import gfile
 
-import datasets
 from transformers import BertTokenizerFast
 
 from ml_collections.config_flags import config_flags
@@ -179,9 +178,6 @@ def main(argv):
 
   config = FLAGS.config
 
-  # Workaround for https://github.com/huggingface/datasets/issues/812
-  logging.getLogger('filelock').setLevel(logging.ERROR)
-
   model = create_model(config)
   optimizer = create_optimizer(config, model)
   del model  # don't keep a copy of the initial model
@@ -200,34 +196,10 @@ def main(argv):
   tokenizer = BertTokenizerFast.from_pretrained(config.tokenizer)
   tokenizer.model_max_length = config.max_seq_length
 
-  # The commented lines below correspond to a data pipeline that uses publicly
-  # available data, in the form of English Wikipedia as processed and hosted by
-  # the HuggingFace datasets library. The pipeline works, and downstream task
-  # performance shows a benefit to pre-training, but I (Nikita) have yet to
-  # confirm that final model quality is on par with the original BERT.
-  #
-  # dataset = datasets.load_dataset('wikipedia', '20200501.en')['train']
-  # data_pipeline = data.PretrainingDataPipelineV1(
-  #   dataset, tokenizer,
-  #   max_predictions_per_seq=config.max_predictions_per_seq)
-
-  # The data pipeline below relies on having text files of Wikipedia + Books in
-  # the same format as the original BERT data. That original data is not
-  # publicly available, so you will need to provide your own. I (Nikita) have
-  # had success using data from Gong et al. "Efficient Training of BERT by
-  # Progressively Stacking", but this data was also obtained through private
-  # correspondence and may not be generally available.
-  # The data_files argument may be a list, if data is split across multiple
-  # input files.
-  dataset = datasets.load_dataset(
-    'bert_data.py',
-    data_files=os.path.expanduser('~/data/bert/corpus.train.tok')
-  )['train']
   data_pipeline = data.PretrainingDataPipeline(
-    dataset, tokenizer,
+    glob.glob('cache/pretrain.*_of_*.tfrecord'),
+    tokenizer,
     max_predictions_per_seq=config.max_predictions_per_seq)
-
-  datasets.logging.set_verbosity_error()
 
   learning_rate_fn = training.create_learning_rate_scheduler(
       factors='constant * linear_warmup * linear_decay',

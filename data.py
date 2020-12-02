@@ -12,415 +12,276 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Huggingface input pipelines."""
+"""Input pipelines."""
 
-import datasets
 import numpy as np
 import random
-import torch
+
+import multiprocessing
+import jax
+import tensorflow as tf
 
 
 class DataPipeline:
-  def __init__(self, dataset):
-    self.dataset = dataset
+  """Base class for input pipelines based on tf.data (and optionally tfds).
+
+  Subclasses must override the following methods:
+    get_tf_dataset(self, batch_size, split, training)
+    process_batch(self, batch)
+  
+  Use get_inputs(...) to generate an iterator over batches of data, represented
+  as python dicts mapping from strings to containing numpy arrays.
+  """
+  def __init__(self, num_workers=0, prefetch_amount=None):
+    """Construct a DataPipeline.
+
+    Args:
+      num_workers: Number of worker processes to use when calling
+          self.process_batch. The default value of 0 performs python
+          post-processing in the main thread, but this can be a performance
+          bottleneck.
+      prefetch_amount: Number of batches to process in advance.
+    """
+    self.num_workers = num_workers
+    if prefetch_amount is None:
+      self.prefetch_amount = num_workers * 2
+    else:
+      assert prefetch_amount >= num_workers
+      self.prefetch_amount = prefetch_amount
+
+    # Hide any GPUs from TensorFlow. Otherwise TF might reserve memory and make
+    # it unavailable to JAX.
+    tf.config.experimental.set_visible_devices([], "GPU")
+
+  def get_tf_dataset(self, batch_size, split, training):
+    raise NotImplementedError(
+      "DataPipeline subclasses must define a get_tf_dataset function.")
+
+  def process_batch(self, batch):
+    raise NotImplementedError(
+      "DataPipeline subclasses must define a process_batch function.")
 
   def get_inputs(self, batch_size, split=None, training=False):
-    dataloader = torch.utils.data.DataLoader(
-      self.dataset if split is None else self.dataset[split],
-      collate_fn=self.collate,
-      batch_size=batch_size,
-      drop_last=training,
-      shuffle=training,
-      num_workers=64,
-      )
-    if training:
-      while True:
-        for batch in iter(dataloader):
-          yield dict(batch)  # The dict-like types from huggingface datasets are not pytrees
-    else:
-      for batch in iter(dataloader):
-        yield dict(batch)  # The dict-like types from huggingface datasets are not pytrees
+    """Returns an iteractor over batches of examples.
 
-  def collate(self, examples):
-    raise NotImplementedError("DataPipeline subclasess must define a collate function.")
+    The behavior of this method should be equivalent to:
+        for example in dataset.as_numpy_iterator():
+          yield self.process_batch(example)
+
+    However, running process_batch in the main thread may create a performance
+    bottleneck, depending on the amount of processing needed. The `num_workers`
+    and `prefetch_amount` constructor arguments allow using multiprocessing to
+    move the dataset out of the main thread.
+    """
+    dataset = self.get_tf_dataset(batch_size, split, training)
+
+    if self.num_workers == 0:
+      for example in dataset.as_numpy_iterator():
+        yield self.process_batch(example)
+      return
+    
+    dummy_in = next(dataset.as_numpy_iterator())
+    treedef_in = jax.tree_structure(dummy_in)
+    dummy_out = self.process_batch(dummy_in)
+    leaves_out, treedef_out = jax.tree_flatten(dummy_out)
+    dtypes_out = [leaf.dtype for leaf in leaves_out]
+
+    with multiprocessing.Pool(self.num_workers) as pool:
+      dataset_head = dataset.take(self.prefetch_amount)
+      dataset_tail = dataset.skip(self.prefetch_amount)
+      prefetch = [
+        pool.apply_async(self.process_batch, (inp,))
+        for inp in dataset_head.as_numpy_iterator()
+      ]
+
+      def outer(in_tf):
+        leaves_in_tf, treedef_in2 = jax.tree_flatten(in_tf)
+        assert treedef_in == treedef_in2
+        def inner(*leaves_in_np):
+          nonlocal prefetch
+          in_np = jax.tree_unflatten(treedef_in, leaves_in_np)
+          prefetch.append(pool.apply_async(self.process_batch, (in_np,)))
+          out_np = prefetch.pop(0).get()
+          leaves_out_np, treedef_out2 = jax.tree_flatten(out_np)
+          assert treedef_out == treedef_out2
+          return leaves_out_np
+        leaves_out_tf = tf.numpy_function(inner, leaves_in_tf, dtypes_out)
+        out_tf = jax.tree_unflatten(treedef_out, leaves_out_tf)
+        return out_tf
+
+      yield from dataset_tail.map(outer).as_numpy_iterator()
+      for out_result in prefetch:
+        yield out_result.get()
 
 
 class ClassificationDataPipeline(DataPipeline):
-  def __init__(self, dataset, tokenizer):
+  def __init__(self, builder_constructor, tokenizer):
+    super().__init__(num_workers=0)
+
+    # Tensorflow has been configured to use CPU only, so we are now ready to
+    # start working with tfds.
+    self.dataset_builder = builder_constructor()
+    self.dataset_builder.download_and_prepare()
     self.tokenizer = tokenizer
+    self.shuffle_buffer_size = 1024
+    self.batch_shuffle_size = 128
 
-    if isinstance(dataset, dict):
-      single_split = dataset['train']
-    else:
-      single_split = dataset
-
-    name_a, *names_other = [
-      name for name, feature in single_split.features.items()
+    self.name_a, *names_other = [
+      name for name, feature in self.dataset_builder.info.features.items()
       if feature.dtype=='string']
     assert len(names_other) <= 1, (
       'Only single sentences and sentence pairs allowed.')
     if names_other:
-      name_b = names_other[0]
-      tokenize = lambda example: self.tokenizer(
-        example[name_a], example[name_b], truncation=True)
+      self.name_b = names_other[0]
     else:
-      tokenize = lambda example: self.tokenizer(
-        example[name_a], truncation=True)
-    mapped_dataset = dataset.map(tokenize, batched=True)
-    mapped_dataset.set_format('numpy', columns=[
-      'idx', 'input_ids', 'token_type_ids', 'attention_mask', 'label'])
-    super().__init__(mapped_dataset)
+      self.name_b = None
 
-  def collate(self, examples):
-    return self.tokenizer.pad(
-      examples,
+  def get_tf_dataset(self, batch_size, split, training):
+    d = self.dataset_builder.as_dataset(split=split, shuffle_files=training)
+    if training:
+      d = d.repeat()
+    if training and self.shuffle_buffer_size is not None:
+      d = d.shuffle(self.shuffle_buffer_size)
+    d = d.batch(batch_size)
+    if training and self.batch_shuffle_size is not None:
+      d = d.shuffle(self.batch_shuffle_size)
+    return d
+
+  def process_batch(self, batch):
+    text_a = [x.decode('utf-8') for x in batch[self.name_a].tolist()]
+    if self.name_b is not None:
+      text_b = [x.decode('utf-8') for x in batch[self.name_b].tolist()]
+    else:
+      text_b = None
+    res = self.tokenizer(
+      text_a, text_b,
+      truncation=True,
       padding='max_length',
       max_length=self.tokenizer.model_max_length,
       return_tensors='np',
+      return_attention_mask=False,
       )
+    res = dict(res)  # Custom dict subclass is not a pytree
+    res['idx'] = batch['idx']
+    res['label'] = batch['label']
+    return res
 
 
 class PretrainingDataPipeline(DataPipeline):
-  FEATURE_NAMES = [
-    'attention_mask',
-    'input_ids',
-    'token_type_ids',
-    'next_sentence_label'
-    ]
-
-  def __init__(self, dataset, tokenizer,
-      short_seq_prob=0.1,
-      max_predictions_per_seq=80):
+  def __init__(self, input_files, tokenizer, max_predictions_per_seq=20,
+      num_workers=4, num_cpu_threads=32):
+    super().__init__(num_workers=4)
+    self.input_files = input_files
     self.tokenizer = tokenizer
-    self.short_seq_prob = short_seq_prob
     self.max_predictions_per_seq = max_predictions_per_seq
+    self.num_cpu_threads = num_cpu_threads
 
-    cache_file_name=(
-      f"cache/"
-      f"pretrain_new_l{self.tokenizer.model_max_length}"
-      f"_s{self.short_seq_prob}"
-      f"_p{self.max_predictions_per_seq}"
-      f".arrow")
+    self.ignore_ids = np.array([
+      self.tokenizer.cls_token_id,
+      self.tokenizer.sep_token_id,
+      self.tokenizer.pad_token_id
+      ], dtype=np.int64)[:,None,None]
 
-    mapped_dataset = dataset.map(
-      self.examples_from_documents, batched=True,
-      remove_columns=dataset.column_names,
-      cache_file_name=cache_file_name,
-      num_proc=32,
-      features=datasets.Features(
-        attention_mask=datasets.features.Sequence(
-          datasets.features.Value(dtype='int8'), length=-1),
-        input_ids=datasets.features.Sequence(
-          datasets.features.Value(dtype='int16'), length=-1),
-        token_type_ids=datasets.features.Sequence(
-          datasets.features.Value(dtype='int8'), length=-1),
-        next_sentence_label=datasets.features.Value(dtype='int8'),
-      ),
-      fn_kwargs=dict(
-        rng=random.Random(0),
-      ))
-    mapped_dataset.set_format('numpy')
+  def decode_record(self, record):
+    example = tf.io.parse_single_example(
+      record,
+      features={
+        "input_ids": tf.io.RaggedFeature(tf.int64),
+      }
+    )
+    example['input_ids'] = tf.pad(
+      example['input_ids'],
+      ((0, self.tokenizer.model_max_length - tf.shape(example['input_ids'])[0]),)
+    )
+    example['input_ids'].set_shape((self.tokenizer.model_max_length,))
+    return example
 
-    super().__init__(mapped_dataset)
+  def get_tf_dataset(self, batch_size, split, training):
+    # For training, we want a lot of parallel reading and shuffling.
+    # For eval, we want no shuffling and parallel reading doesn't matter.
+    if training:
+      d = tf.data.Dataset.from_tensor_slices(tf.constant(self.input_files))
+      d = d.repeat()
+      d = d.shuffle(buffer_size=len(self.input_files))
 
-  def collate(self, examples):
-    examples = self.tokenizer.pad(
-      examples,
-      padding='max_length',
-      max_length=self.tokenizer.model_max_length,
-      return_tensors='np',
-      )
+      # `cycle_length` is the number of parallel files that get read.
+      cycle_length = min(self.num_cpu_threads, len(self.input_files))
 
-    ignore_ids = np.array([
-        self.tokenizer.cls_token_id,
-        self.tokenizer.sep_token_id,
-        self.tokenizer.pad_token_id
-        ], dtype=np.int64)[:, None]
+      # `sloppy` mode means that the interleaving is not exact. This adds
+      # even more randomness to the training pipeline.
+      d = d.interleave(
+        tf.data.TFRecordDataset,
+        cycle_length,
+        num_parallel_calls=tf.data.experimental.AUTOTUNE,
+        deterministic=not training) 
+      d = d.shuffle(buffer_size=100)
+    else:
+      d = tf.data.TFRecordDataset(self.input_files)
 
-    batch_size = examples['input_ids'].shape[0]
-    examples['input_ids'] = examples['input_ids'].copy()
-    examples['masked_lm_positions'] = np.zeros((batch_size, self.max_predictions_per_seq), dtype=np.int64)
-    examples['masked_lm_ids'] = np.zeros((batch_size, self.max_predictions_per_seq), dtype=np.int64)
-    examples['masked_lm_weights'] = np.zeros((batch_size, self.max_predictions_per_seq), dtype=np.float32)
+    d = d.map(self.decode_record, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    d = d.batch(batch_size, drop_remainder=True)
+    return d
+
+  def process_batch(self, batch):
+    batch_size = batch['input_ids'].shape[0]
+    batch['masked_lm_positions'] = np.zeros(
+      (batch_size, self.max_predictions_per_seq), dtype=np.int64)
+    batch['masked_lm_ids'] = np.zeros(
+      (batch_size, self.max_predictions_per_seq), dtype=np.int64)
+    batch['masked_lm_weights'] = np.zeros(
+      (batch_size, self.max_predictions_per_seq), dtype=np.float32)
+
+    # Sentence Order Prediction task
+    batch['next_sentence_label'] = np.random.randint(0, 2, batch_size, dtype=np.int64)
+    segments = np.cumsum(
+      batch['input_ids'][:,::-1] == self.tokenizer.sep_token_id, axis=-1)[:,::-1]
+    segments[:, 0] = 1
+    swapped_segments = np.argsort(
+      np.where(segments==1, -3, -segments), axis=-1, kind='stable')
+    swapped_input_ids = np.take_along_axis(
+      batch['input_ids'], swapped_segments, axis=-1)
+    batch['input_ids'] = np.where(
+      batch['next_sentence_label'][:, None], swapped_input_ids, batch['input_ids'])
+
+    # Token type ids
+    batch['token_type_ids'] = np.cumsum(
+      batch['input_ids'][:, ::-1] == self.tokenizer.sep_token_id,
+      axis=-1)[:, ::-1] % 2
+
+    # Masked LM task
+    prediction_mask = np.all(batch['input_ids'] != self.ignore_ids, axis=0)
+    num_tokens = np.sum(batch['input_ids'] != self.tokenizer.pad_token_id, axis=-1)
     for i in range(batch_size):
-      prediction_mask = np.all(examples['input_ids'][i] != ignore_ids, axis=0)
-      num_tokens = np.sum(examples['attention_mask'][i]).item()
       cand_indexes = np.arange(
-          prediction_mask.shape[0], dtype=np.int32)[prediction_mask]
+          prediction_mask.shape[1], dtype=np.int32)[prediction_mask[i]]
       num_to_predict = min(
-          self.max_predictions_per_seq, max(1, int(num_tokens * 0.15)))
+          self.max_predictions_per_seq, max(1, int(num_tokens[i] * 0.15)))
 
       masked_lm_positions = np.random.choice(
           cand_indexes, num_to_predict, replace=False)
       masked_lm_positions = np.sort(masked_lm_positions)
-      input_ids = examples['input_ids'][i].copy()
-      masked_lm_ids = input_ids[masked_lm_positions]
+      masked_lm_ids = batch['input_ids'][i, masked_lm_positions]
+      batch['masked_lm_positions'][i, :num_to_predict] = masked_lm_positions
+      batch['masked_lm_ids'][i, :num_to_predict] = masked_lm_ids
+      batch['masked_lm_weights'][i, :num_to_predict] = 1.0
 
-      input_ids[masked_lm_positions] = np.where(
-        np.random.random(len(masked_lm_ids)) < 0.8,
-        # 80% of the time, replace with [MASK]
-        self.tokenizer.mask_token_id,
-        np.where(np.random.random(len(masked_lm_ids)) < 0.5,
-          # 10% of the time, keep original
-          masked_lm_ids,
+    do_predict = prediction_mask[
+      np.arange(batch_size)[:, None], batch['masked_lm_positions']]
+    r = np.random.random(batch['masked_lm_ids'].shape)
+    keep_original = (r < 0.1) | ~do_predict
+    replace_with_mask = (r < 0.9)
+
+    batch['input_ids'][np.arange(batch_size)[:, None], batch['masked_lm_positions']
+      ] = np.where(
+        keep_original,
+        # 10% of the time, keep original
+        batch['input_ids'][
+          np.arange(batch_size)[:, None], batch['masked_lm_positions']],
+        np.where(replace_with_mask,
+          # 80% of the time, replace with [MASK]
+          self.tokenizer.mask_token_id,
           # 10% of the time, replace with random word
-          np.random.randint(0, self.tokenizer.vocab_size, masked_lm_ids.shape)))
-      examples['input_ids'][i, :] = input_ids
+          np.random.randint(
+            0, self.tokenizer.vocab_size, batch['masked_lm_ids'].shape)))
 
-      examples['masked_lm_positions'][i, :num_to_predict] = masked_lm_positions
-      examples['masked_lm_ids'][i, :num_to_predict] = masked_lm_ids
-      examples['masked_lm_weights'][i, :num_to_predict] = 1.0
-
-    return examples
-
-  def examples_from_documents(self, documents, rng):
-    max_seq_length = self.tokenizer.model_max_length
-    # Account for [CLS], [SEP], [SEP]
-    max_num_tokens = max_seq_length - 3
-
-    instances = []
-    for text in documents['document']:
-      document = [
-        self.tokenizer.encode(line, add_special_tokens=False)
-        for line in text
-      ]
-
-      # We *usually* want to fill up the entire sequence since we are padding
-      # to `max_seq_length` anyways, so short sequences are generally wasted
-      # computation. However, we *sometimes*
-      # (i.e., short_seq_prob == 0.1 == 10% of the time) want to use shorter
-      # sequences to minimize the mismatch between pre-training and fine-tuning.
-      # The `target_seq_length` is just a rough target however, whereas
-      # `max_seq_length` is a hard limit.
-      target_seq_length = max_num_tokens
-      if rng.random() < self.short_seq_prob:
-        target_seq_length = rng.randint(2, max_num_tokens)
-
-      # We DON'T just concatenate all of the tokens from a document into a long
-      # sequence and choose an arbitrary split point because this would make the
-      # next sentence prediction task too easy. Instead, we split the input into
-      # segments "A" and "B" based on the actual "sentences" provided by the user
-      # input.
-      current_chunk = []
-      current_length = 0
-      i = 0
-      while i < len(document):
-        segment = document[i]
-        current_chunk.append(segment)
-        current_length += len(segment)
-        if i == len(document) - 1 or current_length >= target_seq_length:
-          if current_chunk:
-            # `a_end` is how many segments from `current_chunk` go into the `A`
-            # (first) sentence.
-            a_end = 1
-            if len(current_chunk) >= 2:
-              a_end = rng.randint(1, len(current_chunk) - 1)
-
-            tokens_a = []
-            for j in range(a_end):
-              tokens_a.extend(current_chunk[j])
-
-            tokens_b = []
-            # Random next
-            is_random_next = False
-            if len(current_chunk) == 1:
-              continue  # XXX
-            elif rng.random() < 0.5:
-              is_random_next = True
-              for j in range(a_end, len(current_chunk)):
-                tokens_b.extend(current_chunk[j])
-              # Note(mingdachen): in this case, we just swap tokens_a and tokens_b
-              tokens_a, tokens_b = tokens_b, tokens_a
-            # Actual next
-            else:
-              is_random_next = False
-              for j in range(a_end, len(current_chunk)):
-                tokens_b.extend(current_chunk[j])
-
-            tokens_a, tokens_b, _ = self.tokenizer.truncate_sequences(
-              tokens_a, tokens_b, max(0, len(tokens_a) + len(tokens_b) - max_num_tokens))
-            instance = self.tokenizer.prepare_for_model(tokens_a, tokens_b)
-            if any(token not in self.tokenizer.all_special_ids for token in instance['input_ids']):
-              # Don't add instances that consist entirely of UNK tokens
-              instances.append(instance)
-              instance['next_sentence_label'] = int(is_random_next)
-          current_chunk = []
-          current_length = 0
-        i += 1
-
-    return {k: [instance[k] for instance in instances] for k in self.FEATURE_NAMES}
-
-
-class PretrainingDataPipelineV1(DataPipeline):
-  FEATURE_NAMES = [
-    'attention_mask',
-    'input_ids',
-    'token_type_ids',
-    'next_sentence_label'
-    ]
-
-  def __init__(self, dataset, tokenizer,
-      short_seq_prob=0.1,
-      max_predictions_per_seq=80):
-    self.tokenizer = tokenizer
-    self.short_seq_prob = short_seq_prob
-    self.max_predictions_per_seq = max_predictions_per_seq
-
-    cache_file_name=(
-      f"cache/"
-      f"pretrain_l{self.tokenizer.model_max_length}"
-      f"_s{self.short_seq_prob}"
-      f"_p{self.max_predictions_per_seq}"
-      f".arrow")
-
-    mapped_dataset = dataset.map(
-      self.examples_from_documents, batched=True,
-      remove_columns=dataset.column_names,
-      cache_file_name=cache_file_name,
-      num_proc=32,
-      features=datasets.Features(
-        attention_mask=datasets.features.Sequence(
-          datasets.features.Value(dtype='int8'), length=-1),
-        input_ids=datasets.features.Sequence(
-          datasets.features.Value(dtype='int16'), length=-1),
-        token_type_ids=datasets.features.Sequence(
-          datasets.features.Value(dtype='int8'), length=-1),
-        next_sentence_label=datasets.features.Value(dtype='int8'),
-      ),
-      fn_kwargs=dict(
-        rng=random.Random(0),
-      ))
-    mapped_dataset.set_format('numpy')
-
-    super().__init__(mapped_dataset)
-
-  def collate(self, examples):
-    examples = self.tokenizer.pad(
-      examples,
-      padding='max_length',
-      max_length=self.tokenizer.model_max_length,
-      return_tensors='np',
-      )
-
-    ignore_ids = np.array([
-        self.tokenizer.cls_token_id,
-        self.tokenizer.sep_token_id,
-        self.tokenizer.pad_token_id
-        ], dtype=np.int64)[:, None]
-
-    batch_size = examples['input_ids'].shape[0]
-    examples['input_ids'] = examples['input_ids'].copy()
-    examples['masked_lm_positions'] = np.zeros((batch_size, self.max_predictions_per_seq), dtype=np.int64)
-    examples['masked_lm_ids'] = np.zeros((batch_size, self.max_predictions_per_seq), dtype=np.int64)
-    examples['masked_lm_weights'] = np.zeros((batch_size, self.max_predictions_per_seq), dtype=np.float32)
-    for i in range(batch_size):
-      prediction_mask = np.all(examples['input_ids'][i] != ignore_ids, axis=0)
-      num_tokens = np.sum(examples['attention_mask'][i]).item()
-      cand_indexes = np.arange(
-          prediction_mask.shape[0], dtype=np.int32)[prediction_mask]
-      num_to_predict = min(
-          self.max_predictions_per_seq, max(1, int(num_tokens * 0.15)))
-
-      masked_lm_positions = np.random.choice(
-          cand_indexes, num_to_predict, replace=False)
-      masked_lm_positions = np.sort(masked_lm_positions)
-      input_ids = examples['input_ids'][i].copy()
-      masked_lm_ids = input_ids[masked_lm_positions]
-
-      input_ids[masked_lm_positions] = np.where(
-        np.random.random(len(masked_lm_ids)) < 0.8,
-        # 80% of the time, replace with [MASK]
-        self.tokenizer.mask_token_id,
-        np.where(np.random.random(len(masked_lm_ids)) < 0.5,
-          # 10% of the time, keep original
-          masked_lm_ids,
-          # 10% of the time, replace with random word
-          np.random.randint(0, self.tokenizer.vocab_size, masked_lm_ids.shape)))
-      examples['input_ids'][i, :] = input_ids
-
-      examples['masked_lm_positions'][i, :num_to_predict] = masked_lm_positions
-      examples['masked_lm_ids'][i, :num_to_predict] = masked_lm_ids
-      examples['masked_lm_weights'][i, :num_to_predict] = 1.0
-
-    return examples
-
-  def examples_from_documents(self, documents, rng):
-    max_seq_length = self.tokenizer.model_max_length
-    # Account for [CLS], [SEP], [SEP]
-    max_num_tokens = max_seq_length - 3
-
-    instances = []
-    for text in documents['text']:
-      document = [
-        self.tokenizer.encode(
-          line.strip().replace("\n", " ").replace("()",""),
-          add_special_tokens=False)
-        for line in text.splitlines()
-        if line.strip() and len(line) >= 80
-      ]
-
-      # We *usually* want to fill up the entire sequence since we are padding
-      # to `max_seq_length` anyways, so short sequences are generally wasted
-      # computation. However, we *sometimes*
-      # (i.e., short_seq_prob == 0.1 == 10% of the time) want to use shorter
-      # sequences to minimize the mismatch between pre-training and fine-tuning.
-      # The `target_seq_length` is just a rough target however, whereas
-      # `max_seq_length` is a hard limit.
-      target_seq_length = max_num_tokens
-      if rng.random() < self.short_seq_prob:
-        target_seq_length = rng.randint(2, max_num_tokens)
-
-      # We DON'T just concatenate all of the tokens from a document into a long
-      # sequence and choose an arbitrary split point because this would make the
-      # next sentence prediction task too easy. Instead, we split the input into
-      # segments "A" and "B" based on the actual "sentences" provided by the user
-      # input.
-      current_chunk = []
-      current_length = 0
-      i = 0
-      while i < len(document):
-        segment = document[i]
-        current_chunk.append(segment)
-        current_length += len(segment)
-        if i == len(document) - 1 or current_length >= target_seq_length:
-          if current_chunk:
-            # `a_end` is how many segments from `current_chunk` go into the `A`
-            # (first) sentence.
-            a_end = 1
-            if len(current_chunk) >= 2:
-              a_end = rng.randint(1, len(current_chunk) - 1)
-
-            tokens_a = []
-            for j in range(a_end):
-              tokens_a.extend(current_chunk[j])
-
-            tokens_b = []
-            # Random next
-            is_random_next = False
-            if len(current_chunk) == 1:
-              continue  # XXX
-            elif rng.random() < 0.5:
-              is_random_next = True
-              for j in range(a_end, len(current_chunk)):
-                tokens_b.extend(current_chunk[j])
-              # Note(mingdachen): in this case, we just swap tokens_a and tokens_b
-              tokens_a, tokens_b = tokens_b, tokens_a
-            # Actual next
-            else:
-              is_random_next = False
-              for j in range(a_end, len(current_chunk)):
-                tokens_b.extend(current_chunk[j])
-
-            tokens_a, tokens_b, _ = self.tokenizer.truncate_sequences(
-              tokens_a, tokens_b, max(0, len(tokens_a) + len(tokens_b) - max_num_tokens))
-            instance = self.tokenizer.prepare_for_model(tokens_a, tokens_b)
-            if any(token not in self.tokenizer.all_special_ids for token in instance['input_ids']):
-              # Don't add instances that consist entirely of UNK tokens
-              instances.append(instance)
-              instance['next_sentence_label'] = int(is_random_next)
-          current_chunk = []
-          current_length = 0
-        i += 1
-
-    return {k: [instance[k] for instance in instances] for k in self.FEATURE_NAMES}
-
+    return batch
