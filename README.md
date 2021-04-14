@@ -1,3 +1,5 @@
+# Archived: see https://github.com/nikitakit/sabertooth instead
+
 # BERT in Flax
 
 ***NOTE: This implementation is work in progress!***
